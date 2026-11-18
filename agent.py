@@ -28,6 +28,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
 }
 
@@ -40,8 +41,18 @@ FREE_MODELS = [
     "google/gemma-4-31b-it:free",
 ]
 
+DATE_RU_RE = re.compile(
+    r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+    re.IGNORECASE,
+)
+DATE_DOT_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 
-def get_msk_now() -> datetime:
+
+def get_target_date() -> datetime:
+    custom = os.getenv("TEST_DATE", "").strip()
+    if custom:
+        dt = datetime.strptime(custom, "%d.%m.%Y")
+        return dt.replace(tzinfo=MSK)
     return datetime.now(MSK)
 
 
@@ -52,121 +63,177 @@ def detect_mode(msk_now: datetime) -> str:
     return "morning" if msk_now.hour < 16 else "evening"
 
 
-def fetch_html(url: str, timeout: int = 20) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or "utf-8"
-    return resp.text
+def fetch_soup(url: str, timeout: int = 20) -> BeautifulSoup | None:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = soup.title.get_text(strip=True) if soup.title else "без заголовка"
+        logging.info("Загружено %s (%d байт) | Заголовок: %s", url, len(resp.text), title[:70])
+        return soup
+    except Exception as exc:
+        logging.warning("Не удалось загрузить %s: %s", url, exc)
+        return None
 
 
 def parse_standings() -> str:
-    """Парсит турнирную таблицу КХЛ (Запад и Восток)."""
-    url = "https://www.khl.ru/standings/"
-    try:
-        html = fetch_html(url)
-        soup = BeautifulSoup(html, "html.parser")
-        tables_out = []
+    """Парсит турнирную таблицу КХЛ из доступных источников."""
+    sources = [
+        "https://text.khl.ru/standings/",
+        "https://www.sports.ru/hockey/tournament/khl/table/",
+        "https://www.khl.ru/standings/",
+    ]
+    for url in sources:
+        soup = fetch_soup(url)
+        if not soup:
+            continue
 
+        tables_out = []
         for idx, table in enumerate(soup.find_all("table")):
             rows = []
             for tr in table.find_all("tr"):
                 cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-                cells = [c for c in cells if c]
-                if len(cells) >= 6:
+                cells = [re.sub(r"\s+", " ", c) for c in cells if c]
+                if len(cells) >= 5:
                     rows.append(" | ".join(cells[:12]))
-            if len(rows) >= 5:
-                title = "Конференция Запад" if idx == 0 else (
-                    "Конференция Восток" if idx == 1 else f"Таблица {idx + 1}"
-                )
+            if len(rows) >= 6:
+                title = "Таблица / Конференция 1" if idx == 0 else f"Таблица / Конференция {idx + 1}"
                 tables_out.append(f"=== {title} ===\n" + "\n".join(rows))
 
         if tables_out:
+            logging.info("Турнирная таблица получена из %s", url)
             return "\n\n".join(tables_out[:2])
 
-        # Резервное извлечение текста страницы, если структура таблиц изменилась
-        body_text = soup.get_text("\n", strip=True)
-        lines = [line for line in body_text.splitlines() if line]
-        return "\n".join(lines[:140])
-    except Exception as exc:
-        logging.warning("Ошибка при загрузке таблицы КХЛ: %s", exc)
-        return "Турнирная таблица временно недоступна."
+    return "Турнирная таблица временно недоступна."
 
 
 def extract_game_protocol_stats(game_url: str) -> str:
-    """Догружает командную статистику из протокола матча для вечернего анализа."""
-    try:
-        html = fetch_html(game_url, timeout=12)
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text("\n", strip=True)
-        keywords = (
-            "Броски в створ", "Штраф", "Вбрасывания",
-            "Силовые приемы", "Блокированные броски", "Голы в большинстве",
-        )
-        lines = text.splitlines()
-        extracted = []
-        for i, line in enumerate(lines):
-            if any(k.lower() in line.lower() for k in keywords):
-                prev_val = lines[i - 1] if i > 0 else ""
-                next_val = lines[i + 1] if i + 1 < len(lines) else ""
-                extracted.append(f"{prev_val} — {line} — {next_val}".strip(" —"))
-        return "; ".join(extracted[:8])
-    except Exception:
+    """Догружает статистику матча для вечернего разбора ошибок."""
+    if not game_url:
+        return ""
+    soup = fetch_soup(game_url, timeout=12)
+    if not soup:
         return ""
 
+    text = soup.get_text("\n", strip=True)
+    keywords = (
+        "Броски в створ", "Броски", "Штраф", "Вбрасывания",
+        "Силовые приемы", "Блокированные броски", "Большинство", "Голы в большинстве",
+    )
+    lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+    extracted = []
+    for i, line in enumerate(lines):
+        if any(k.lower() == line.lower() or (len(line) < 35 and k.lower() in line.lower()) for k in keywords):
+            prev_val = lines[i - 1] if i > 0 and len(lines[i - 1]) < 20 else ""
+            next_val = lines[i + 1] if i + 1 < len(lines) and len(lines[i + 1]) < 20 else ""
+            item = f"{prev_val} — {line} — {next_val}".strip(" —")
+            if item not in extracted:
+                extracted.append(item)
+    return "; ".join(extracted[:8])
 
-def parse_today_games(msk_now: datetime, mode: str) -> list[dict]:
-    """Парсит матчи КХЛ на текущую дату по МСК."""
-    url = "https://www.khl.ru/calendar/"
-    date_ru = f"{msk_now.day} {MONTHS_RU[msk_now.month]}"
-    date_dot = msk_now.strftime("%d.%m.%Y")
-    logging.info("Ищем матчи на дату: %s (%s)", date_ru, date_dot)
 
-    html = fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
+def parse_from_sports_ru(date_dot: str, date_ru: str) -> list[dict]:
+    """Парсит календарь и результаты КХЛ со Sports.ru (стабильный HTML)."""
+    url = "https://www.sports.ru/hockey/tournament/khl/calendar/"
+    soup = fetch_soup(url)
+    if not soup:
+        return []
 
     games = []
-    seen_urls = set()
-
-    # Ищем карточки матчей / ссылки на игры /game/
-    for link in soup.find_all("a", href=re.compile(r"/game/\d+/\d+")):
-        href = urljoin("https://www.khl.ru", link.get("href", ""))
-        if href in seen_urls:
+    seen = set()
+    for tr in soup.find_all("tr"):
+        row_text = re.sub(r"\s+", " ", tr.get_text(" ", strip=True)).strip()
+        if date_dot not in row_text and date_ru.lower() not in row_text.lower():
             continue
-
-        # Поднимаемся к родительскому контейнеру матча и блока даты
-        card = link
-        for _ in range(5):
-            if card.parent:
-                card = card.parent
-
-        block_text = card.get_text(" ", strip=True)
-        parent_section = card.parent.get_text(" ", strip=True) if card.parent else block_text
-
-        # Проверяем принадлежность сегодняшнему игровому дню
-        if date_ru not in parent_section and date_dot not in parent_section:
+        if len(row_text) < 12 or row_text in seen:
             continue
+        seen.add(row_text)
 
-        seen_urls.add(href)
-        clean_info = re.sub(r"\s+", " ", block_text).strip()
-        if len(clean_info) < 8:
-            continue
+        match_url = ""
+        for a in tr.find_all("a", href=True):
+            if "/match/" in a["href"] or "/stat/" in a["href"]:
+                match_url = urljoin(url, a["href"])
+                break
 
-        game_entry = {
-            "summary": clean_info[:350],
-            "url": href,
-            "stats": "",
-        }
-        if mode == "evening":
-            game_entry["stats"] = extract_game_protocol_stats(href)
-            time.sleep(0.5)
-
-        games.append(game_entry)
+        games.append({"summary": row_text[:350], "url": match_url, "stats": ""})
 
     return games
 
 
-def build_prompt(msk_now: datetime, mode: str, standings: str, games: list[dict]) -> tuple[str, str]:
-    date_label = f"{msk_now.day} {MONTHS_RU[msk_now.month]} {msk_now.year}"
+def parse_sequential_calendar(url: str, link_pattern: str, date_dot: str, date_ru: str) -> list[dict]:
+    """Последовательно обходит DOM-дерево, связывая заголовки дат с карточками матчей."""
+    soup = fetch_soup(url)
+    if not soup:
+        return []
+
+    target_ru = date_ru.lower()
+    active_is_target = False
+    games = []
+    seen_urls = set()
+
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "div", "tr", "a"]):
+        text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
+        if not text:
+            continue
+
+        # Проверяем, является ли короткий блок заголовком даты
+        if len(text) <= 45:
+            m_ru = DATE_RU_RE.search(text)
+            m_dot = DATE_DOT_RE.search(text)
+            if m_ru or m_dot:
+                found_ru = f"{int(m_ru.group(1))} {m_ru.group(2).lower()}" if m_ru else ""
+                found_dot = m_dot.group(1) if m_dot else ""
+                active_is_target = (found_ru == target_ru) or (found_dot == date_dot)
+                continue
+
+        if tag.name == "a" and re.search(link_pattern, tag.get("href", "")):
+            href = urljoin(url, tag["href"])
+            if href in seen_urls:
+                continue
+
+            card = tag
+            for _ in range(4):
+                if card.parent and card.parent.name not in ("body", "html"):
+                    card = card.parent
+            card_text = re.sub(r"\s+", " ", card.get_text(" ", strip=True)).strip()
+
+            has_date_inside = (date_dot in card_text) or (target_ru in card_text.lower())
+            if (active_is_target or has_date_inside) and 8 <= len(card_text) <= 450:
+                seen_urls.add(href)
+                games.append({"summary": card_text[:350], "url": href, "stats": ""})
+
+    return games
+
+
+def parse_today_games(target_dt: datetime, mode: str) -> list[dict]:
+    """Собирает матчи КХЛ на заданную дату с резервированием источников."""
+    date_ru = f"{target_dt.day} {MONTHS_RU[target_dt.month]}"
+    date_dot = target_dt.strftime("%d.%m.%Y")
+    logging.info("Ищем матчи на дату: %s (%s)", date_ru, date_dot)
+
+    games = parse_sequential_calendar(
+        "https://text.khl.ru/calendar/", r"/game/", date_dot, date_ru
+    )
+    if not games:
+        games = parse_from_sports_ru(date_dot, date_ru)
+    if not games:
+        games = parse_sequential_calendar(
+            "https://www.khl.ru/calendar/", r"/game/\d+/\d+", date_dot, date_ru
+        )
+
+    if mode == "evening" and games:
+        for game in games:
+            if game["url"]:
+                game["stats"] = extract_game_protocol_stats(game["url"])
+                time.sleep(0.5)
+
+    return games
+
+
+def build_prompt(target_dt: datetime, mode: str, standings: str, games: list[dict]) -> tuple[str, str]:
+    date_label = f"{target_dt.day} {MONTHS_RU[target_dt.month]} {target_dt.year}"
     games_text = "\n".join(
         f"{idx}. {g['summary']}"
         + (f"\n   Статистика протокола: {g['stats']}" if g["stats"] else "")
@@ -239,7 +306,6 @@ def generate_analysis(system_prompt: str, user_prompt: str) -> str:
                 },
             )
             content = (resp.choices[0].message.content or "").strip()
-            # Убираем блоки размышлений <think>...</think>, если модель их вернула
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             if len(content) > 100:
                 logging.info("Успешный ответ от %s (%d символов)", model_id, len(content))
@@ -253,7 +319,6 @@ def generate_analysis(system_prompt: str, user_prompt: str) -> str:
 
 
 def sanitize_telegram_html(text: str) -> str:
-    """Приводит ответ модели к валидному Telegram HTML."""
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p>\s*<p>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</?p>", "", text, flags=re.IGNORECASE)
@@ -261,7 +326,6 @@ def sanitize_telegram_html(text: str) -> str:
     text = re.sub(r"__(.+?)__", r"<i>\1</i>", text)
     text = re.sub(r"^#{1,3}\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
 
-    # Оставляем только разрешенные Telegram теги
     allowed = ("b", "strong", "i", "em", "u", "s", "code", "pre", "blockquote")
     tag_pattern = re.compile(r"</?([a-zA-Z0-9]+)(?:\s[^>]*)?>")
 
@@ -277,7 +341,6 @@ def sanitize_telegram_html(text: str) -> str:
 
 
 def split_chunks(text: str, max_len: int = 3900) -> list[str]:
-    """Разбивает длинный пост по абзацам, не разрывая HTML-теги внутри блоков."""
     if len(text) <= max_len:
         return [text]
 
@@ -335,18 +398,18 @@ def send_to_telegram(text: str) -> None:
 
 
 def main() -> None:
-    msk_now = get_msk_now()
-    mode = detect_mode(msk_now)
-    logging.info("Запуск КХЛ-агента | Время МСК: %s | Режим: %s", msk_now.strftime("%Y-%m-%d %H:%M"), mode)
+    target_dt = get_target_date()
+    mode = detect_mode(target_dt)
+    logging.info("Запуск КХЛ-агента | Дата: %s | Режим: %s", target_dt.strftime("%Y-%m-%d %H:%M"), mode)
 
-    games = parse_today_games(msk_now, mode)
+    games = parse_today_games(target_dt, mode)
     if not games:
-        logging.info("На сегодня (%s) матчей КХЛ не найдено. Публикация пропущена.", msk_now.strftime("%d.%m.%Y"))
+        logging.info("На дату (%s) матчей КХЛ не найдено. Публикация пропущена.", target_dt.strftime("%d.%m.%Y"))
         return
 
-    logging.info("Найдено матчей на сегодня: %d", len(games))
+    logging.info("Найдено матчей: %d", len(games))
     standings = parse_standings()
-    system_prompt, user_prompt = build_prompt(msk_now, mode, standings, games)
+    system_prompt, user_prompt = build_prompt(target_dt, mode, standings, games)
     post_text = generate_analysis(system_prompt, user_prompt)
     send_to_telegram(post_text)
 

@@ -34,15 +34,16 @@ DATE_DOT_RE = re.compile(r"\b(\d{2})\.(\d{2})(?:\.(\d{4}))?\b")
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
 
-def fetch_soup(url: str, timeout: int = 20) -> BeautifulSoup | None:
+def fetch_soup(url: str, timeout: int = 25) -> BeautifulSoup | None:
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
         r.raise_for_status()
         if not r.encoding or r.encoding.lower() == "iso-8859-1":
             r.encoding = r.apparent_encoding or "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
-        title = soup.title.get_text(strip=True) if soup.title else ""
-        logging.info("Загружено %s (%d байт) | %s", url, len(r.text), title[:60])
+        for bad in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            bad.decompose()
+        logging.info("Загружено %s (%d байт)", url, len(r.text))
         return soup
     except Exception as e:
         logging.warning("Ошибка загрузки %s: %s", url, e)
@@ -66,22 +67,26 @@ def norm_date(text: str, year: int) -> str | None:
 
 
 def parse_standings() -> str:
-    for url in ("https://text.khl.ru/standings/", "https://www.sports.ru/hockey/tournament/khl/table/"):
-        soup = fetch_soup(url)
-        if not soup:
-            continue
-        out = []
-        for idx, tbl in enumerate(soup.find_all("table"), 1):
-            rows = [
-                " | ".join(c for c in [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])] if c)[:120]
-                for tr in tbl.find_all("tr")
-            ]
-            rows = [r for r in rows if r.count("|") >= 4]
-            if len(rows) >= 6:
-                out.append(f"=== Конференция {idx} ===\n" + "\n".join(rows))
-        if out:
-            return "\n\n".join(out[:2])
-    return "Турнирная таблица недоступна."
+    soup = fetch_soup("https://www.sports.ru/hockey/tournament/khl/table/")
+    if not soup:
+        return "Турнирная таблица недоступна."
+
+    out = []
+    for idx, tbl in enumerate(soup.find_all("table"), 1):
+        rows = [
+            " | ".join(c for c in [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])] if c)[:120]
+            for tr in tbl.find_all("tr")
+        ]
+        rows = [r for r in rows if r.count("|") >= 4]
+        if len(rows) >= 6:
+            out.append(f"=== Конференция {idx} ===\n" + "\n".join(rows))
+    if out:
+        return "\n\n".join(out[:2])
+
+    # Если таблица сверстана через div — берем очищенный текст основного блока
+    root = soup.find("main") or soup.body or soup
+    lines = [re.sub(r"\s+", " ", l).strip() for l in root.get_text("\n").splitlines() if l.strip()]
+    return "\n".join(lines[:140])
 
 
 def parse_protocol(url: str) -> str:
@@ -100,70 +105,63 @@ def parse_protocol(url: str) -> str:
 
 
 def parse_games(target_dot: str, year: int, mode: str) -> list[dict]:
-    games = []
-    # 1. Текстовая версия КХЛ
-    soup = fetch_soup("https://text.khl.ru/calendar/")
-    if soup:
-        links = {
-            re.sub(r"\s+", " ", a.get_text(" ", strip=True)): urljoin("https://text.khl.ru", a["href"])
-            for a in soup.find_all("a", href=re.compile(r"/game/\d+/\d+"))
-        }
-        lines = [re.sub(r"\s+", " ", l).strip() for l in soup.get_text("\n").splitlines() if l.strip()]
-        dates, active, chunk = [], False, []
-        for line in lines:
-            if len(line) <= 45 and not TIME_RE.search(line):
-                dt = norm_date(line, year)
-                if dt:
-                    if dt not in dates:
-                        dates.append(dt)
-                    if dt == target_dot:
-                        active = True
-                        continue
-                    elif active:
-                        break
-            if active:
-                if "все права защищены" in line.lower():
-                    break
-                if TIME_RE.fullmatch(line) and chunk:
-                    s = " | ".join(chunk)
-                    u = next((v for k, v in links.items() if k and k in s), "")
-                    games.append({"summary": s[:350], "url": u, "stats": ""})
-                    chunk = [line]
-                else:
-                    chunk.append(line)
-        if chunk and len(" | ".join(chunk)) >= 8:
-            s = " | ".join(chunk)
-            u = next((v for k, v in links.items() if k and k in s), "")
-            games.append({"summary": s[:350], "url": u, "stats": ""})
-        logging.info("Даты на text.khl.ru: %s", ", ".join(dates[:12]) or "нет")
+    soup = fetch_soup("https://www.sports.ru/hockey/tournament/khl/calendar/")
+    if not soup:
+        return []
 
-    # 2. Резерв: Sports.ru
-    if not games:
-        soup = fetch_soup("https://www.sports.ru/hockey/tournament/khl/calendar/")
-        if soup:
-            active_dt, dates, seen = None, [], set()
-            for el in soup.find_all(["h2", "h3", "h4", "tr"]):
-                if el.name in ("h2", "h3", "h4"):
-                    dt = norm_date(el.get_text(" ", strip=True), year)
-                    if dt:
-                        active_dt = dt
-                        if dt not in dates:
-                            dates.append(dt)
-                    continue
-                cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in el.find_all(["th", "td"]) if c.get_text(strip=True)]
-                if not cells:
-                    continue
-                dt0 = norm_date(cells[0], year)
-                if dt0:
-                    active_dt = dt0
-                    if dt0 not in dates:
-                        dates.append(dt0)
-                row = " | ".join(cells)
-                if active_dt == target_dot and len(row) >= 10 and row not in seen and (TIME_RE.search(row) or ":" in row or "-" in row):
-                    seen.add(row)
-                    a = el.find("a", href=re.compile(r"/(match|stat)/"))
-                    games.append({"summary": row[:350], "url": urljoin("https://www.sports.ru", a["href"]) if a else "", "stats": ""})
-            logging.info("Даты на Sports.ru: %s", ", ".join(dates[:12]) or "нет")
+    # Собираем ссылки на карточки матчей
+    match_links = {}
+    for a in soup.find_all("a", href=re.compile(r"/hockey/match/")):
+        href = urljoin("https://www.sports.ru", a["href"])
+        txt = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+        if len(txt) >= 3:
+            match_links[txt] = href
+
+    root = soup.find("main") or soup.body or soup
+    lines = [re.sub(r"\s+", " ", l).strip() for l in root.get_text("\n").splitlines() if l.strip()]
+
+    active_dt = None
+    dates_seen = []
+    day_lines = []
+
+    for line in lines:
+        # Короткая строка с датой переключает текущий игровой день
+        if len(line) <= 50:
+            dt = norm_date(line, year)
+            if dt:
+                active_dt = dt
+                if dt not in dates_seen:
+                    dates_seen.append(dt)
+                # Если в самой строке с датой есть время или команды — сохраняем
+                if active_dt == target_dot and (TIME_RE.search(line) or len(line) > 16):
+                    day_lines.append(line)
+                continue
+
+        if active_dt == target_dot:
+            day_lines.append(line)
+
+    logging.info("Даты на Sports.ru (%d шт.): %s", len(dates_seen), ", ".join(dates_seen[:12]) or "нет")
+
+    if not day_lines:
+        return []
+
+    # Группируем строки дня по матчам (ориентир — время начала HH:MM)
+    games = []
+    chunk = []
+    for item in day_lines:
+        if TIME_RE.search(item) and len(item) <= 25 and chunk:
+            summary = " | ".join(chunk)
+            url = next((u for k, u in match_links.items() if k in summary), "")
+            games.append({"summary": summary[:350], "url": url, "stats": ""})
+            chunk = [item]
+        else:
+            chunk.append(item)
+
+    if chunk:
+        summary = " | ".join(chunk)
+        if len(summary) >= 8:
+            url = next((u for k, u in match_links.items() if k in summary), "")
+            games.append({"summary": summary[:350], "url": url, "stats": ""})
 
     if mode == "evening":
         for g in games:

@@ -32,7 +32,6 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
 }
 
-# Актуальный список бесплатных моделей OpenRouter с автоматическим фолбэком
 FREE_MODELS = [
     "openrouter/free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -41,18 +40,16 @@ FREE_MODELS = [
     "google/gemma-4-31b-it:free",
 ]
 
-DATE_RU_RE = re.compile(
-    r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
-    re.IGNORECASE,
-)
-DATE_DOT_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
+MONTHS_PATTERN = "|".join(MONTHS_RU.values())
+DATE_RU_RE = re.compile(rf"\b(\d{{1,2}})\s+({MONTHS_PATTERN})\b", re.IGNORECASE)
+DATE_SHORT_RE = re.compile(r"\b(\d{2})\.(\d{2})(?:\.(\d{4}))?\b")
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
 
 def get_target_date() -> datetime:
     custom = os.getenv("TEST_DATE", "").strip()
     if custom:
-        dt = datetime.strptime(custom, "%d.%m.%Y")
-        return dt.replace(tzinfo=MSK)
+        return datetime.strptime(custom, "%d.%m.%Y").replace(tzinfo=MSK)
     return datetime.now(MSK)
 
 
@@ -71,15 +68,35 @@ def fetch_soup(url: str, timeout: int = 20) -> BeautifulSoup | None:
             resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else "без заголовка"
-        logging.info("Загружено %s (%d байт) | Заголовок: %s", url, len(resp.text), title[:70])
+        logging.info("Загружено %s (%d байт) | %s", url, len(resp.text), title[:65])
         return soup
     except Exception as exc:
         logging.warning("Не удалось загрузить %s: %s", url, exc)
         return None
 
 
+def normalize_date_token(text: str, default_year: int) -> str | None:
+    """Извлекает дату из строки и приводит к единому виду ДД.ММ.ГГГГ."""
+    m_ru = DATE_RU_RE.search(text)
+    if m_ru:
+        day = int(m_ru.group(1))
+        month_name = m_ru.group(2).lower()
+        month = next((k for k, v in MONTHS_RU.items() if v == month_name), None)
+        if month and 1 <= day <= 31:
+            return f"{day:02d}.{month:02d}.{default_year}"
+
+    m_dot = DATE_SHORT_RE.search(text)
+    if m_dot:
+        day, month = int(m_dot.group(1)), int(m_dot.group(2))
+        year = int(m_dot.group(3)) if m_dot.group(3) else default_year
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return f"{day:02d}.{month:02d}.{year}"
+
+    return None
+
+
 def parse_standings() -> str:
-    """Парсит турнирную таблицу КХЛ из доступных источников."""
+    """Парсит турнирную таблицу КХЛ."""
     sources = [
         "https://text.khl.ru/standings/",
         "https://www.sports.ru/hockey/tournament/khl/table/",
@@ -94,8 +111,8 @@ def parse_standings() -> str:
         for idx, table in enumerate(soup.find_all("table")):
             rows = []
             for tr in table.find_all("tr"):
-                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-                cells = [re.sub(r"\s+", " ", c) for c in cells if c]
+                cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+                cells = [c for c in cells if c]
                 if len(cells) >= 5:
                     rows.append(" | ".join(cells[:12]))
             if len(rows) >= 6:
@@ -110,7 +127,7 @@ def parse_standings() -> str:
 
 
 def extract_game_protocol_stats(game_url: str) -> str:
-    """Догружает статистику матча для вечернего разбора ошибок."""
+    """Догружает командную статистику из протокола матча для вечернего анализа."""
     if not game_url:
         return ""
     soup = fetch_soup(game_url, timeout=12)
@@ -134,94 +151,140 @@ def extract_game_protocol_stats(game_url: str) -> str:
     return "; ".join(extracted[:8])
 
 
-def parse_from_sports_ru(date_dot: str, date_ru: str) -> list[dict]:
-    """Парсит календарь и результаты КХЛ со Sports.ru (стабильный HTML)."""
+def parse_khl_text_calendar(target_dot: str, year: int) -> list[dict]:
+    """Построчный разбор текстовой версии календаря КХЛ (text.khl.ru)."""
+    url = "https://text.khl.ru/calendar/"
+    soup = fetch_soup(url)
+    if not soup:
+        return []
+
+    # Собираем все ссылки на протоколы матчей со страницы
+    game_links = {}
+    for a in soup.find_all("a", href=re.compile(r"/game/\d+/\d+")):
+        href = urljoin(url, a["href"])
+        label = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+        if label:
+            game_links[label] = href
+
+    raw_lines = [re.sub(r"\s+", " ", l).strip() for l in soup.get_text("\n").splitlines()]
+    lines = [l for l in raw_lines if l]
+
+    spotted_dates = []
+    in_target_day = False
+    day_lines = []
+
+    for line in lines:
+        # Заголовок даты обычно короткий и содержит день + месяц (без счёта и длинного текста)
+        if len(line) <= 45 and not TIME_RE.search(line):
+            dt_str = normalize_date_token(line, year)
+            if dt_str:
+                if dt_str not in spotted_dates:
+                    spotted_dates.append(dt_str)
+                if dt_str == target_dot:
+                    in_target_day = True
+                    continue
+                elif in_target_day:
+                    # Начался следующий игровой день — останавливаем сбор
+                    break
+
+        if in_target_day:
+            if any(stop in line.lower() for stop in ("© кхл", "все права защищены", "партнеры лиги")):
+                break
+            day_lines.append(line)
+
+    logging.info("Даты на text.khl.ru: %s", ", ".join(spotted_dates[:12]) or "не найдены")
+
+    if not day_lines:
+        return []
+
+    # Группируем собранные строки дня по матчам (ориентир — время начала HH:MM)
+    games = []
+    current_chunk = []
+    for item in day_lines:
+        if TIME_RE.fullmatch(item) and current_chunk:
+            summary = " | ".join(current_chunk)
+            matched_url = next((u for lbl, u in game_links.items() if lbl in summary), "")
+            games.append({"summary": summary[:350], "url": matched_url, "stats": ""})
+            current_chunk = [item]
+        else:
+            current_chunk.append(item)
+
+    if current_chunk:
+        summary = " | ".join(current_chunk)
+        if len(summary) >= 8:
+            matched_url = next((u for lbl, u in game_links.items() if lbl in summary), "")
+            games.append({"summary": summary[:350], "url": matched_url, "stats": ""})
+
+    return games
+
+
+def parse_sports_ru_calendar(target_dot: str, year: int) -> list[dict]:
+    """Разбор календаря КХЛ на Sports.ru с учетом rowspan и заголовков дат."""
     url = "https://www.sports.ru/hockey/tournament/khl/calendar/"
     soup = fetch_soup(url)
     if not soup:
         return []
 
+    active_date = None
+    spotted_dates = []
     games = []
     seen = set()
-    for tr in soup.find_all("tr"):
-        row_text = re.sub(r"\s+", " ", tr.get_text(" ", strip=True)).strip()
-        if date_dot not in row_text and date_ru.lower() not in row_text.lower():
-            continue
-        if len(row_text) < 12 or row_text in seen:
-            continue
-        seen.add(row_text)
 
+    for elem in soup.find_all(["h2", "h3", "h4", "tr"]):
+        if elem.name in ("h2", "h3", "h4"):
+            dt_str = normalize_date_token(elem.get_text(" ", strip=True), year)
+            if dt_str:
+                active_date = dt_str
+                if dt_str not in spotted_dates:
+                    spotted_dates.append(dt_str)
+            continue
+
+        # Строка таблицы <tr>
+        cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in elem.find_all(["th", "td"])]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+
+        # Проверяем, указана ли дата в первой ячейке строки (при rowspan она есть только у 1-го матча дня)
+        first_cell_date = normalize_date_token(cells[0], year)
+        if first_cell_date:
+            active_date = first_cell_date
+            if first_cell_date not in spotted_dates:
+                spotted_dates.append(first_cell_date)
+
+        if active_date != target_dot:
+            continue
+
+        row_text = " | ".join(cells)
+        if len(row_text) < 10 or row_text in seen:
+            continue
+        # Отсекаем шапки таблиц без времени и команд
+        if not TIME_RE.search(row_text) and ":" not in row_text and "-" not in row_text:
+            continue
+
+        seen.add(row_text)
         match_url = ""
-        for a in tr.find_all("a", href=True):
+        for a in elem.find_all("a", href=True):
             if "/match/" in a["href"] or "/stat/" in a["href"]:
                 match_url = urljoin(url, a["href"])
                 break
 
         games.append({"summary": row_text[:350], "url": match_url, "stats": ""})
 
-    return games
-
-
-def parse_sequential_calendar(url: str, link_pattern: str, date_dot: str, date_ru: str) -> list[dict]:
-    """Последовательно обходит DOM-дерево, связывая заголовки дат с карточками матчей."""
-    soup = fetch_soup(url)
-    if not soup:
-        return []
-
-    target_ru = date_ru.lower()
-    active_is_target = False
-    games = []
-    seen_urls = set()
-
-    for tag in soup.find_all(["h1", "h2", "h3", "h4", "div", "tr", "a"]):
-        text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
-        if not text:
-            continue
-
-        # Проверяем, является ли короткий блок заголовком даты
-        if len(text) <= 45:
-            m_ru = DATE_RU_RE.search(text)
-            m_dot = DATE_DOT_RE.search(text)
-            if m_ru or m_dot:
-                found_ru = f"{int(m_ru.group(1))} {m_ru.group(2).lower()}" if m_ru else ""
-                found_dot = m_dot.group(1) if m_dot else ""
-                active_is_target = (found_ru == target_ru) or (found_dot == date_dot)
-                continue
-
-        if tag.name == "a" and re.search(link_pattern, tag.get("href", "")):
-            href = urljoin(url, tag["href"])
-            if href in seen_urls:
-                continue
-
-            card = tag
-            for _ in range(4):
-                if card.parent and card.parent.name not in ("body", "html"):
-                    card = card.parent
-            card_text = re.sub(r"\s+", " ", card.get_text(" ", strip=True)).strip()
-
-            has_date_inside = (date_dot in card_text) or (target_ru in card_text.lower())
-            if (active_is_target or has_date_inside) and 8 <= len(card_text) <= 450:
-                seen_urls.add(href)
-                games.append({"summary": card_text[:350], "url": href, "stats": ""})
-
+    logging.info("Даты на Sports.ru: %s", ", ".join(spotted_dates[:12]) or "не найдены")
     return games
 
 
 def parse_today_games(target_dt: datetime, mode: str) -> list[dict]:
-    """Собирает матчи КХЛ на заданную дату с резервированием источников."""
-    date_ru = f"{target_dt.day} {MONTHS_RU[target_dt.month]}"
-    date_dot = target_dt.strftime("%d.%m.%Y")
-    logging.info("Ищем матчи на дату: %s (%s)", date_ru, date_dot)
+    target_dot = target_dt.strftime("%d.%m.%Y")
+    logging.info("Ищем матчи на дату: %s", target_dot)
 
-    games = parse_sequential_calendar(
-        "https://text.khl.ru/calendar/", r"/game/", date_dot, date_ru
-    )
+    games = parse_khl_text_calendar(target_dot, target_dt.year)
     if not games:
-        games = parse_from_sports_ru(date_dot, date_ru)
-    if not games:
-        games = parse_sequential_calendar(
-            "https://www.khl.ru/calendar/", r"/game/\d+/\d+", date_dot, date_ru
-        )
+        games = parse_sports_ru_calendar(target_dot, target_dt.year)
+
+    for idx, g in enumerate(games, 1):
+        logging.info("Матч %d: %s", idx, g["summary"])
 
     if mode == "evening" and games:
         for game in games:
@@ -378,41 +441,4 @@ def send_to_telegram(text: str) -> None:
     for idx, chunk in enumerate(chunks, 1):
         payload = {
             "chat_id": channel_id,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        resp = requests.post(api_url, json=payload, timeout=20)
-        if not resp.ok:
-            logging.warning("Ошибка HTML в части %d (%s), отправка без разметки...", idx, resp.text)
-            plain_chunk = re.sub(r"<[^>]+>", "", chunk)
-            fallback_payload = {
-                "chat_id": channel_id,
-                "text": plain_chunk,
-                "disable_web_page_preview": True,
-            }
-            fb_resp = requests.post(api_url, json=fallback_payload, timeout=20)
-            fb_resp.raise_for_status()
-        logging.info("Часть %d/%d успешно опубликована в %s", idx, len(chunks), channel_id)
-        time.sleep(1)
-
-
-def main() -> None:
-    target_dt = get_target_date()
-    mode = detect_mode(target_dt)
-    logging.info("Запуск КХЛ-агента | Дата: %s | Режим: %s", target_dt.strftime("%Y-%m-%d %H:%M"), mode)
-
-    games = parse_today_games(target_dt, mode)
-    if not games:
-        logging.info("На дату (%s) матчей КХЛ не найдено. Публикация пропущена.", target_dt.strftime("%d.%m.%Y"))
-        return
-
-    logging.info("Найдено матчей: %d", len(games))
-    standings = parse_standings()
-    system_prompt, user_prompt = build_prompt(target_dt, mode, standings, games)
-    post_text = generate_analysis(system_prompt, user_prompt)
-    send_to_telegram(post_text)
-
-
-if __name__ == "__main__":
-    main()
+            "text": chunk

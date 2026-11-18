@@ -9,29 +9,18 @@ import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 MSK = timezone(timedelta(hours=3))
-
 MONTHS_RU = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля",
     5: "мая", 6: "июня", 7: "июля", 8: "августа",
     9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
 }
-
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
 }
-
 FREE_MODELS = [
     "openrouter/free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -40,394 +29,237 @@ FREE_MODELS = [
     "google/gemma-4-31b-it:free",
 ]
 
-MONTHS_PATTERN = "|".join(MONTHS_RU.values())
-DATE_RU_RE = re.compile(rf"\b(\d{{1,2}})\s+({MONTHS_PATTERN})\b", re.IGNORECASE)
-DATE_SHORT_RE = re.compile(r"\b(\d{2})\.(\d{2})(?:\.(\d{4}))?\b")
+DATE_RU_RE = re.compile(rf"\b(\d{{1,2}})\s+({'|'.join(MONTHS_RU.values())})\b", re.I)
+DATE_DOT_RE = re.compile(r"\b(\d{2})\.(\d{2})(?:\.(\d{4}))?\b")
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
-
-
-def get_target_date() -> datetime:
-    custom = os.getenv("TEST_DATE", "").strip()
-    if custom:
-        return datetime.strptime(custom, "%d.%m.%Y").replace(tzinfo=MSK)
-    return datetime.now(MSK)
-
-
-def detect_mode(msk_now: datetime) -> str:
-    forced = os.getenv("RUN_MODE", "auto").strip().lower()
-    if forced in ("morning", "evening"):
-        return forced
-    return "morning" if msk_now.hour < 16 else "evening"
 
 
 def fetch_soup(url: str, timeout: int = 20) -> BeautifulSoup | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
-            resp.encoding = resp.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(resp.text, "html.parser")
-        title = soup.title.get_text(strip=True) if soup.title else "без заголовка"
-        logging.info("Загружено %s (%d байт) | %s", url, len(resp.text), title[:65])
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        if not r.encoding or r.encoding.lower() == "iso-8859-1":
+            r.encoding = r.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = soup.title.get_text(strip=True) if soup.title else ""
+        logging.info("Загружено %s (%d байт) | %s", url, len(r.text), title[:60])
         return soup
-    except Exception as exc:
-        logging.warning("Не удалось загрузить %s: %s", url, exc)
+    except Exception as e:
+        logging.warning("Ошибка загрузки %s: %s", url, e)
         return None
 
 
-def normalize_date_token(text: str, default_year: int) -> str | None:
-    m_ru = DATE_RU_RE.search(text)
-    if m_ru:
-        day = int(m_ru.group(1))
-        month_name = m_ru.group(2).lower()
-        month = next((k for k, v in MONTHS_RU.items() if v == month_name), None)
+def norm_date(text: str, year: int) -> str | None:
+    m = DATE_RU_RE.search(text)
+    if m:
+        day = int(m.group(1))
+        month = next((k for k, v in MONTHS_RU.items() if v == m.group(2).lower()), None)
         if month and 1 <= day <= 31:
-            return f"{day:02d}.{month:02d}.{default_year}"
-
-    m_dot = DATE_SHORT_RE.search(text)
-    if m_dot:
-        day, month = int(m_dot.group(1)), int(m_dot.group(2))
-        year = int(m_dot.group(3)) if m_dot.group(3) else default_year
-        if 1 <= day <= 31 and 1 <= month <= 12:
             return f"{day:02d}.{month:02d}.{year}"
-
+    m = DATE_DOT_RE.search(text)
+    if m:
+        d, mo = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else year
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            return f"{d:02d}.{mo:02d}.{y}"
     return None
 
 
 def parse_standings() -> str:
-    sources = [
-        "https://text.khl.ru/standings/",
-        "https://www.sports.ru/hockey/tournament/khl/table/",
-        "https://www.khl.ru/standings/",
-    ]
-    for url in sources:
+    for url in ("https://text.khl.ru/standings/", "https://www.sports.ru/hockey/tournament/khl/table/"):
         soup = fetch_soup(url)
         if not soup:
             continue
-
-        tables_out = []
-        for idx, table in enumerate(soup.find_all("table")):
-            rows = []
-            for tr in table.find_all("tr"):
-                cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
-                cells = [c for c in cells if c]
-                if len(cells) >= 5:
-                    rows.append(" | ".join(cells[:12]))
+        out = []
+        for idx, tbl in enumerate(soup.find_all("table"), 1):
+            rows = [
+                " | ".join(c for c in [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])] if c)[:120]
+                for tr in tbl.find_all("tr")
+            ]
+            rows = [r for r in rows if r.count("|") >= 4]
             if len(rows) >= 6:
-                title = f"Таблица / Конференция {idx + 1}"
-                tables_out.append(f"=== {title} ===\n" + "\n".join(rows))
-
-        if tables_out:
-            logging.info("Турнирная таблица получена из %s", url)
-            return "\n\n".join(tables_out[:2])
-
-    return "Турнирная таблица временно недоступна."
+                out.append(f"=== Конференция {idx} ===\n" + "\n".join(rows))
+        if out:
+            return "\n\n".join(out[:2])
+    return "Турнирная таблица недоступна."
 
 
-def extract_game_protocol_stats(game_url: str) -> str:
-    if not game_url:
-        return ""
-    soup = fetch_soup(game_url, timeout=12)
+def parse_protocol(url: str) -> str:
+    soup = fetch_soup(url, timeout=12)
     if not soup:
         return ""
-
-    text = soup.get_text("\n", strip=True)
-    keywords = (
-        "Броски в створ", "Броски", "Штраф", "Вбрасывания",
-        "Силовые приемы", "Блокированные броски", "Большинство", "Голы в большинстве",
-    )
-    lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
-    extracted = []
+    lines = [re.sub(r"\s+", " ", l).strip() for l in soup.get_text("\n").splitlines() if l.strip()]
+    keys = ("Броски в створ", "Штраф", "Вбрасывания", "Большинство", "Голы в большинстве")
+    res = []
     for i, line in enumerate(lines):
-        if any(k.lower() == line.lower() or (len(line) < 35 and k.lower() in line.lower()) for k in keywords):
-            prev_val = lines[i - 1] if i > 0 and len(lines[i - 1]) < 20 else ""
-            next_val = lines[i + 1] if i + 1 < len(lines) and len(lines[i + 1]) < 20 else ""
-            item = f"{prev_val} — {line} — {next_val}".strip(" —")
-            if item not in extracted:
-                extracted.append(item)
-    return "; ".join(extracted[:8])
+        if len(line) < 35 and any(k.lower() in line.lower() for k in keys):
+            prev_v = lines[i - 1] if i > 0 and len(lines[i - 1]) < 20 else ""
+            next_v = lines[i + 1] if i + 1 < len(lines) and len(lines[i + 1]) < 20 else ""
+            res.append(f"{prev_v} — {line} — {next_v}".strip(" —"))
+    return "; ".join(dict.fromkeys(res))[:400]
 
 
-def parse_khl_text_calendar(target_dot: str, year: int) -> list[dict]:
-    url = "https://text.khl.ru/calendar/"
-    soup = fetch_soup(url)
-    if not soup:
-        return []
-
-    game_links = {}
-    for a in soup.find_all("a", href=re.compile(r"/game/\d+/\d+")):
-        href = urljoin(url, a["href"])
-        label = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
-        if label:
-            game_links[label] = href
-
-    raw_lines = [re.sub(r"\s+", " ", l).strip() for l in soup.get_text("\n").splitlines()]
-    lines = [l for l in raw_lines if l]
-
-    spotted_dates = []
-    in_target_day = False
-    day_lines = []
-
-    for line in lines:
-        if len(line) <= 45 and not TIME_RE.search(line):
-            dt_str = normalize_date_token(line, year)
-            if dt_str:
-                if dt_str not in spotted_dates:
-                    spotted_dates.append(dt_str)
-                if dt_str == target_dot:
-                    in_target_day = True
-                    continue
-                elif in_target_day:
+def parse_games(target_dot: str, year: int, mode: str) -> list[dict]:
+    games = []
+    # 1. Текстовая версия КХЛ
+    soup = fetch_soup("https://text.khl.ru/calendar/")
+    if soup:
+        links = {
+            re.sub(r"\s+", " ", a.get_text(" ", strip=True)): urljoin("https://text.khl.ru", a["href"])
+            for a in soup.find_all("a", href=re.compile(r"/game/\d+/\d+"))
+        }
+        lines = [re.sub(r"\s+", " ", l).strip() for l in soup.get_text("\n").splitlines() if l.strip()]
+        dates, active, chunk = [], False, []
+        for line in lines:
+            if len(line) <= 45 and not TIME_RE.search(line):
+                dt = norm_date(line, year)
+                if dt:
+                    if dt not in dates:
+                        dates.append(dt)
+                    if dt == target_dot:
+                        active = True
+                        continue
+                    elif active:
+                        break
+            if active:
+                if "все права защищены" in line.lower():
                     break
+                if TIME_RE.fullmatch(line) and chunk:
+                    s = " | ".join(chunk)
+                    u = next((v for k, v in links.items() if k and k in s), "")
+                    games.append({"summary": s[:350], "url": u, "stats": ""})
+                    chunk = [line]
+                else:
+                    chunk.append(line)
+        if chunk and len(" | ".join(chunk)) >= 8:
+            s = " | ".join(chunk)
+            u = next((v for k, v in links.items() if k and k in s), "")
+            games.append({"summary": s[:350], "url": u, "stats": ""})
+        logging.info("Даты на text.khl.ru: %s", ", ".join(dates[:12]) or "нет")
 
-        if in_target_day:
-            if any(stop in line.lower() for stop in ("© кхл", "все права защищены", "партнеры лиги")):
-                break
-            day_lines.append(line)
-
-    logging.info("Даты на text.khl.ru: %s", ", ".join(spotted_dates[:12]) or "не найдены")
-
-    if not day_lines:
-        return []
-
-    games = []
-    current_chunk = []
-    for item in day_lines:
-        if TIME_RE.fullmatch(item) and current_chunk:
-            summary = " | ".join(current_chunk)
-            matched_url = next((u for lbl, u in game_links.items() if lbl in summary), "")
-            games.append({"summary": summary[:350], "url": matched_url, "stats": ""})
-            current_chunk = [item]
-        else:
-            current_chunk.append(item)
-
-    if current_chunk:
-        summary = " | ".join(current_chunk)
-        if len(summary) >= 8:
-            matched_url = next((u for lbl, u in game_links.items() if lbl in summary), "")
-            games.append({"summary": summary[:350], "url": matched_url, "stats": ""})
-
-    return games
-
-
-def parse_sports_ru_calendar(target_dot: str, year: int) -> list[dict]:
-    url = "https://www.sports.ru/hockey/tournament/khl/calendar/"
-    soup = fetch_soup(url)
-    if not soup:
-        return []
-
-    active_date = None
-    spotted_dates = []
-    games = []
-    seen = set()
-
-    for elem in soup.find_all(["h2", "h3", "h4", "tr"]):
-        if elem.name in ("h2", "h3", "h4"):
-            dt_str = normalize_date_token(elem.get_text(" ", strip=True), year)
-            if dt_str:
-                active_date = dt_str
-                if dt_str not in spotted_dates:
-                    spotted_dates.append(dt_str)
-            continue
-
-        cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in elem.find_all(["th", "td"])]
-        cells = [c for c in cells if c]
-        if not cells:
-            continue
-
-        first_cell_date = normalize_date_token(cells[0], year)
-        if first_cell_date:
-            active_date = first_cell_date
-            if first_cell_date not in spotted_dates:
-                spotted_dates.append(first_cell_date)
-
-        if active_date != target_dot:
-            continue
-
-        row_text = " | ".join(cells)
-        if len(row_text) < 10 or row_text in seen:
-            continue
-        if not TIME_RE.search(row_text) and ":" not in row_text and "-" not in row_text:
-            continue
-
-        seen.add(row_text)
-        match_url = ""
-        for a in elem.find_all("a", href=True):
-            if "/match/" in a["href"] or "/stat/" in a["href"]:
-                match_url = urljoin(url, a["href"])
-                break
-
-        games.append({"summary": row_text[:350], "url": match_url, "stats": ""})
-
-    logging.info("Даты на Sports.ru: %s", ", ".join(spotted_dates[:12]) or "не найдены")
-    return games
-
-
-def parse_today_games(target_dt: datetime, mode: str) -> list[dict]:
-    target_dot = target_dt.strftime("%d.%m.%Y")
-    logging.info("Ищем матчи на дату: %s", target_dot)
-
-    games = parse_khl_text_calendar(target_dot, target_dt.year)
+    # 2. Резерв: Sports.ru
     if not games:
-        games = parse_sports_ru_calendar(target_dot, target_dt.year)
+        soup = fetch_soup("https://www.sports.ru/hockey/tournament/khl/calendar/")
+        if soup:
+            active_dt, dates, seen = None, [], set()
+            for el in soup.find_all(["h2", "h3", "h4", "tr"]):
+                if el.name in ("h2", "h3", "h4"):
+                    dt = norm_date(el.get_text(" ", strip=True), year)
+                    if dt:
+                        active_dt = dt
+                        if dt not in dates:
+                            dates.append(dt)
+                    continue
+                cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in el.find_all(["th", "td"]) if c.get_text(strip=True)]
+                if not cells:
+                    continue
+                dt0 = norm_date(cells[0], year)
+                if dt0:
+                    active_dt = dt0
+                    if dt0 not in dates:
+                        dates.append(dt0)
+                row = " | ".join(cells)
+                if active_dt == target_dot and len(row) >= 10 and row not in seen and (TIME_RE.search(row) or ":" in row or "-" in row):
+                    seen.add(row)
+                    a = el.find("a", href=re.compile(r"/(match|stat)/"))
+                    games.append({"summary": row[:350], "url": urljoin("https://www.sports.ru", a["href"]) if a else "", "stats": ""})
+            logging.info("Даты на Sports.ru: %s", ", ".join(dates[:12]) or "нет")
 
-    for idx, g in enumerate(games, 1):
-        logging.info("Матч %d: %s", idx, g["summary"])
-
-    if mode == "evening" and games:
-        for game in games:
-            if game["url"]:
-                game["stats"] = extract_game_protocol_stats(game["url"])
-                time.sleep(0.5)
-
+    if mode == "evening":
+        for g in games:
+            if g["url"]:
+                g["stats"] = parse_protocol(g["url"])
+                time.sleep(0.4)
     return games
 
 
-def build_prompt(target_dt: datetime, mode: str, standings: str, games: list[dict]) -> tuple[str, str]:
-    date_label = f"{target_dt.day} {MONTHS_RU[target_dt.month]} {target_dt.year}"
-    games_text = "\n".join(
-        f"{idx}. {g['summary']}"
-        + (f"\n   Статистика протокола: {g['stats']}" if g["stats"] else "")
-        for idx, g in enumerate(games, 1)
-    )
+def ask_llm(system_p: str, user_p: str) -> str:
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
+    last_err = None
+    for model in FREE_MODELS:
+        try:
+            logging.info("Запрос к модели: %s", model)
+            r = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system_p}, {"role": "user", "content": user_p}],
+                temperature=0.6,
+                max_tokens=3000,
+                extra_headers={"HTTP-Referer": "https://github.com", "X-Title": "KHL Agent"},
+            )
+            txt = re.sub(r"<think>.*?</think>", "", (r.choices[0].message.content or ""), flags=re.S).strip()
+            if len(txt) > 100:
+                return txt
+        except Exception as e:
+            last_err = e
+            logging.warning("Модель %s недоступна: %s", model, e)
+            time.sleep(2)
+    raise RuntimeError(f"Нет доступных моделей OpenRouter: {last_err}")
 
-    system_prompt = (
-        "Ты — профессиональный хоккейный аналитик и автор Telegram-канала о КХЛ. "
-        "Пиши живым, экспертным языком без воды и выдуманных фактов, опираясь на переданные данные.\n"
-        "ФОРМАТИРОВАНИЕ (СТРОГО):\n"
-        "- Используй ТОЛЬКО HTML-теги Telegram: <b>жирный</b>, <i>курсив</i>, <blockquote>цитата</blockquote>.\n"
-        "- ЗАПРЕЩЕН Markdown (**звездочки**, ### заголовки, списки через *).\n"
-        "- Не используй символы < и > в тексте, кроме разрешенных тегов."
-    )
 
+def send_telegram(raw_text: str) -> None:
+    token, chat_id = os.environ["TELEGRAM_TOKEN"], os.environ["CHANNEL_ID"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", raw_text)
+    txt = re.sub(r"^#{1,3}\s*(.+)$", r"<b>\1</b>", txt, flags=re.M).strip()
+
+    chunks, cur = [], ""
+    for para in txt.split("\n\n"):
+        cand = f"{cur}\n\n{para}".strip() if cur else para
+        if len(cand) <= 3900:
+            cur = cand
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = para[:3900]
+    if cur:
+        chunks.append(cur)
+
+    for i, chunk in enumerate(chunks, 1):
+        resp = requests.post(url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=20)
+        if not resp.ok:
+            plain = re.sub(r"<[^>]+>", "", chunk)
+            requests.post(url, json={"chat_id": chat_id, "text": plain, "disable_web_page_preview": True}, timeout=20).raise_for_status()
+        logging.info("Опубликована часть %d/%d", i, len(chunks))
+        time.sleep(1)
+
+
+def main() -> None:
+    now = datetime.now(MSK)
+    forced = os.getenv("RUN_MODE", "auto").strip().lower()
+    mode = forced if forced in ("morning", "evening") else ("morning" if now.hour < 16 else "evening")
+    date_dot = now.strftime("%d.%m.%Y")
+    date_label = f"{now.day} {MONTHS_RU[now.month]} {now.year}"
+    logging.info("Старт агента | %s МСК | Режим: %s", now.strftime("%d.%m.%Y %H:%M"), mode)
+
+    games = parse_games(date_dot, now.year, mode)
+    if not games:
+        logging.info("На %s матчей КХЛ не найдено. Выход.", date_dot)
+        return
+
+    logging.info("Найдено матчей: %d", len(games))
+    standings = parse_standings()
+    games_str = "\n".join(f"{i}. {g['summary']}" + (f" | Стат: {g['stats']}" if g["stats"] else "") for i, g in enumerate(games, 1))
+
+    sys_p = (
+        "Ты хоккейный аналитик Telegram-канала о КХЛ. Пиши ярко и по делу без выдуманных фактов. "
+        "Используй ТОЛЬКО HTML-теги Telegram: <b>, <i>, <blockquote>. Никакого Markdown (** или #)."
+    )
     if mode == "morning":
-        user_prompt = (
-            f"Дата: {date_label}. Сделай утренний анонс и разбор всех матчей дня КХЛ.\n\n"
-            f"ТУРНИРНАЯ ТАБЛИЦА КХЛ:\n{standings}\n\n"
-            f"МАТЧИ НА СЕГОДНЯ:\n{games_text}\n\n"
-            "Структура поста:\n"
-            f"1. Заголовок: 🏒 <b>Игровой день КХЛ — {date_label}</b> и краткое вступление (1–2 предложения).\n"
-            "2. По каждому матчу:\n"
-            "   — Время начала (МСК), афиша и актуальные места команд в таблице + очки.\n"
-            "   — <b>Плюсы и минусы соперников:</b> сильные и уязвимые стороны каждой команды.\n"
-            "   — <b>Ключ к матчу:</b> за счет чего решится исход встречи.\n"
-            "3. В конце — <blockquote>Главный матч дня и вопрос подписчикам.</blockquote>"
+        usr_p = (
+            f"Сделай утренний разбор матчей КХЛ на {date_label}.\nТАБЛИЦА:\n{standings}\n\nМАТЧИ:\n{games_str}\n\n"
+            f"Формат:\n🏒 <b>Игровой день КХЛ — {date_label}</b>\nПо каждому матчу: время МСК, места в таблице и очки, "
+            "<b>Плюсы и минусы команд</b>, <b>Ключ к матчу</b>.\nВ конце: <blockquote>Главный матч дня и вопрос подписчикам.</blockquote>"
         )
     else:
-        user_prompt = (
-            f"Дата: {date_label}. Сделай вечерний итоговый обзор завершенных матчей дня в КХЛ.\n\n"
-            f"ТУРНИРНАЯ ТАБЛИЦА КХЛ:\n{standings}\n\n"
-            f"РЕЗУЛЬТАТЫ И ПРОТОКОЛЫ ДНЯ:\n{games_text}\n\n"
-            "Структура поста:\n"
-            f"1. Заголовок: 🚨 <b>Итоги игрового дня КХЛ — {date_label}</b>.\n"
-            "2. По каждому матчу:\n"
-            "   — Итоговый счет (с отметкой ОТ или Б, если были) и ход игры.\n"
-            "   — <b>Разбор игры и что пошло не так:</b> подробно разбери причины поражения проигравшей команды "
-            "(провал периода, реализация бросков, удаления, игра вратаря или потеря концентрации).\n"
-            "3. В конце — <blockquote>Главный итог вечера.</blockquote>"
+        usr_p = (
+            f"Сделай вечерний итог матчей КХЛ за {date_label}.\nТАБЛИЦА:\n{standings}\n\nРЕЗУЛЬТАТЫ:\n{games_str}\n\n"
+            f"Формат:\n🚨 <b>Итоги игрового дня КХЛ — {date_label}</b>\nПо каждому матчу: счет, ход игры и блок "
+            "<b>Разбор игры и что пошло не так</b> (причины поражения проигравшей команды).\nВ конце: <blockquote>Главный итог вечера.</blockquote>"
         )
 
-    return system_prompt, user_prompt
+    post = ask_llm(sys_p, usr_p)
+    send_telegram(post)
 
 
-def generate_analysis(system_prompt: str, user_prompt: str) -> str:
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"],
-    )
-
-    last_error = None
-    for model_id in FREE_MODELS:
-        try:
-            logging.info("Запрос к модели OpenRouter: %s", model_id)
-            resp = client.chat.completions.create(
-                model=model_id,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.6,
-                max_tokens=3200,
-                extra_headers={
-                    "HTTP-Referer": "https://github.com",
-                    "X-Title": "KHL Telegram Analyst",
-                },
-            )
-            content = (resp.choices[0].message.content or "").strip()
-            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-            if len(content) > 100:
-                logging.info("Успешный ответ от %s (%d символов)", model_id, len(content))
-                return content
-        except Exception as exc:
-            last_error = exc
-            logging.warning("Модель %s недоступна (%s), пробуем следующую...", model_id, exc)
-            time.sleep(2)
-
-    raise RuntimeError(f"Все бесплатные модели OpenRouter вернули ошибку. Последняя: {last_error}")
-
-
-def sanitize_telegram_html(text: str) -> str:
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</p>\s*<p>", "\n\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</?p>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__(.+?)__", r"<i>\1</i>", text)
-    text = re.sub(r"^#{1,3}\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-
-    allowed = ("b", "strong", "i", "em", "u", "s", "code", "pre", "blockquote")
-    tag_pattern = re.compile(r"</?([a-zA-Z0-9]+)(?:\s[^>]*)?>")
-
-    def replace_tag(match: re.Match) -> str:
-        tag_name = match.group(1).lower()
-        if tag_name in allowed:
-            is_closing = match.group(0).startswith("</")
-            return f"</{tag_name}>" if is_closing else f"<{tag_name}>"
-        return ""
-
-    text = tag_pattern.sub(replace_tag, text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-
-def split_chunks(text: str, max_len: int = 3900) -> list[str]:
-    if len(text) <= max_len:
-        return [text]
-
-    paragraphs = text.split("\n\n")
-    chunks = []
-    current = ""
-
-    for para in paragraphs:
-        candidate = f"{current}\n\n{para}".strip() if current else para
-        if len(candidate) <= max_len:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            if len(para) <= max_len:
-                current = para
-            else:
-                for i in range(0, len(para), max_len):
-                    chunks.append(para[i:i + max_len])
-                current = ""
-
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def send_to_telegram(text: str) -> None:
-    token = os.environ["TELEGRAM_TOKEN"]
-    channel_id = os.environ["CHANNEL_ID"]
-    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    clean_text = sanitize_telegram_html(text)
-    chunks = split_chunks(clean_text)
-
-    for idx, chunk in enumerate(chunks, 1):
-        payload = {
-            "chat_id": channel_id,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        resp = requests
+if __name__ == "__main__":
+    main()
